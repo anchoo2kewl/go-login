@@ -196,17 +196,21 @@ func (h *Handler) handleCallback(w http.ResponseWriter, r *http.Request, provide
 	}
 
 	if emailUser != nil {
-		// Email exists but registered with a different provider
-		registeredProvider, err := h.store.GetUserAuthProvider(ctx, emailUser.ID)
+		// Email matches an existing account — link this provider and sign in.
+		linkedUser, err := h.store.LinkOAuthProvider(ctx, emailUser.ID, providerName, info.ProviderUserID)
 		if err != nil {
-			h.logger.Error("GetUserAuthProvider failed",
+			h.logger.Error("LinkOAuthProvider failed",
 				zap.Int64("user_id", emailUser.ID),
+				zap.String("provider", providerName),
 				zap.Error(err))
 			h.redirectError(w, r, "database error", "internal_error")
 			return
 		}
-		msg := fmt.Sprintf("this email is registered with %s — please sign in with %s", registeredProvider, registeredProvider)
-		h.redirectError(w, r, msg, "email_exists_different_provider")
+		h.logger.Info("OAuth provider linked to existing account",
+			zap.String("provider", providerName),
+			zap.Int64("user_id", emailUser.ID),
+			zap.String("email", emailUser.Email))
+		h.issueTokenAndRedirect(w, r, linkedUser)
 		return
 	}
 

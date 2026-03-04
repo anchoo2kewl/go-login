@@ -31,4 +31,9 @@ type UserStore interface {
 	// still usable. Returns (nil, nil) when the code is not found or is already
 	// used/expired.
 	ValidateInviteCode(ctx context.Context, code string) (*InviteInfo, error)
+
+	// LinkOAuthProvider associates a new OAuth provider with an existing user
+	// account. Called when a user signs in via a provider whose email matches an
+	// existing account. Should be idempotent if the provider is already linked.
+	LinkOAuthProvider(ctx context.Context, userID int64, provider, providerUserID string) (*User, error)
 }
