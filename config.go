@@ -2,6 +2,7 @@ package gologin
 
 import (
 	"fmt"
+	"net/http"
 	"time"
 
 	"go.uber.org/zap"
@@ -48,6 +49,12 @@ type Config struct {
 
 	// Logger is an optional zap.Logger. When nil a no-op logger is used.
 	Logger *zap.Logger
+
+	// OnLoginSuccess is an optional callback invoked after a successful OAuth
+	// login or signup, just before the redirect. Use it to record login events
+	// (e.g. audit logs, activity tracking). The callback receives the original
+	// HTTP request and the authenticated user's ID.
+	OnLoginSuccess func(r *http.Request, userID int64)
 }
 
 // Validate checks that all required fields are populated.

@@ -259,6 +259,10 @@ func (h *Handler) issueTokenAndRedirect(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	if h.cfg.OnLoginSuccess != nil {
+		h.cfg.OnLoginSuccess(r, u.ID)
+	}
+
 	target := h.cfg.SuccessURL + "?token=" + url.QueryEscape(token)
 	http.Redirect(w, r, target, http.StatusTemporaryRedirect)
 }
