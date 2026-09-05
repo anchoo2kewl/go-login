@@ -2,9 +2,13 @@ package gologin
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -13,11 +17,12 @@ import (
 // Handler holds the initialised configuration and store, and provides HTTP
 // handler methods that can be registered directly on any router.
 type Handler struct {
-	cfg     *Config
-	store   UserStore
-	logger  *zap.Logger
-	google  oauthProvider
-	github  oauthProvider
+	cfg    *Config
+	store  UserStore
+	logger *zap.Logger
+	google oauthProvider
+	github oauthProvider
+	clerk  *ClerkVerifier
 }
 
 // NewHandler validates the config and returns a ready-to-use Handler.
@@ -42,9 +47,19 @@ func NewHandler(cfg *Config, store UserStore) (*Handler, error) {
 	if cfg.GitHub != nil {
 		h.github = newGithubProvider(cfg.GitHub)
 	}
+	if cfg.Clerk != nil {
+		v, err := NewClerkVerifier(*cfg.Clerk)
+		if err != nil {
+			return nil, err
+		}
+		h.clerk = v
+	}
 
 	return h, nil
 }
+
+// Clerk returns the Clerk verifier, or nil when Clerk is not configured.
+func (h *Handler) Clerk() *ClerkVerifier { return h.clerk }
 
 // HandleGoogleInitiate starts the Google OAuth flow.
 // Mount at: GET /api/auth/google
@@ -275,4 +290,93 @@ func (h *Handler) redirectError(w http.ResponseWriter, r *http.Request, message,
 		"code":  {code},
 	}
 	http.Redirect(w, r, h.cfg.ErrorURL+"?"+params.Encode(), http.StatusTemporaryRedirect)
+}
+
+// ----- Clerk -------------------------------------------------------------------
+
+// HandleClerkExchange swaps a Clerk session token for a go-login access token.
+// Mount at: POST /api/auth/clerk/exchange
+//
+// The token comes as JSON {"token": "..."} or an "Authorization: Bearer"
+// header. The reply is {"token": "<jwt>", "user": {"id": ..., "email": ...}}.
+// A browser signed in with Clerk calls this once and then talks to the API
+// with the go-login token like any other session.
+func (h *Handler) HandleClerkExchange(w http.ResponseWriter, r *http.Request) {
+	if h.clerk == nil {
+		writeJSONError(w, http.StatusNotFound, "Clerk sign-in is not configured", "not_configured")
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSONError(w, http.StatusMethodNotAllowed, "method not allowed", "method_not_allowed")
+		return
+	}
+
+	token := bearerToken(r.Header.Get("Authorization"))
+	if token == "" && r.Body != nil {
+		var body struct {
+			Token string `json:"token"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body); err != nil && err != io.EOF {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON body", "bad_request")
+			return
+		}
+		token = strings.TrimSpace(body.Token)
+	}
+	if token == "" {
+		writeJSONError(w, http.StatusBadRequest, "missing token", "missing_token")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	u, _, err := h.clerk.Resolve(ctx, token, h.store)
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrClerkTokenInvalid):
+		h.logger.Warn("clerk token rejected", zap.Error(err))
+		writeJSONError(w, http.StatusUnauthorized, "invalid or expired token", "invalid_token")
+		return
+	case errors.Is(err, ErrClerkNoEmail):
+		writeJSONError(w, http.StatusUnauthorized, "provider did not return an email address", "no_email")
+		return
+	default:
+		h.logger.Error("clerk resolve failed", zap.Error(err))
+		writeJSONError(w, http.StatusInternalServerError, "database error", "internal_error")
+		return
+	}
+
+	signed, err := GenerateToken(u.ID, u.Email, h.cfg.JWTSecret, h.cfg.jwtExpiry())
+	if err != nil {
+		h.logger.Error("failed to generate JWT", zap.Int64("user_id", u.ID), zap.Error(err))
+		writeJSONError(w, http.StatusInternalServerError, "failed to generate session token", "token_error")
+		return
+	}
+
+	if h.cfg.OnLoginSuccess != nil {
+		h.cfg.OnLoginSuccess(r, u.ID)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"token": signed,
+		"user":  map[string]any{"id": u.ID, "email": u.Email},
+	})
+}
+
+// bearerToken strips a "Bearer " prefix, or returns "" when there is none.
+func bearerToken(header string) string {
+	header = strings.TrimSpace(header)
+	if len(header) > 7 && strings.EqualFold(header[:7], "bearer ") {
+		return strings.TrimSpace(header[7:])
+	}
+	return ""
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message, "code": code})
 }

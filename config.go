@@ -3,6 +3,7 @@ package gologin
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -19,13 +20,15 @@ type OAuthProviderConfig struct {
 	RedirectURL string
 }
 
-// Config configures the go-login handler. Both Google and GitHub fields are
-// optional; a nil pointer means that provider is disabled.
+// Config configures the go-login handler. Every provider field is optional; a
+// nil pointer means that provider is disabled. At least one must be set.
 type Config struct {
 	// Google OAuth provider config. Nil disables Google sign-in.
 	Google *OAuthProviderConfig
 	// GitHub OAuth provider config. Nil disables GitHub sign-in.
 	GitHub *OAuthProviderConfig
+	// Clerk session-token config. Nil disables Clerk sign-in.
+	Clerk *ClerkConfig
 
 	// SuccessURL is the frontend URL the user is redirected to after a
 	// successful login/signup. The JWT token is appended as "?token=<jwt>".
@@ -51,7 +54,8 @@ type Config struct {
 	Logger *zap.Logger
 
 	// OnLoginSuccess is an optional callback invoked after a successful OAuth
-	// login or signup, just before the redirect. Use it to record login events
+	// login or signup, just before the redirect, and after a successful Clerk
+	// exchange, just before the response. Use it to record login events
 	// (e.g. audit logs, activity tracking). The callback receives the original
 	// HTTP request and the authenticated user's ID.
 	OnLoginSuccess func(r *http.Request, userID int64)
@@ -59,23 +63,29 @@ type Config struct {
 
 // Validate checks that all required fields are populated.
 func (c *Config) Validate() error {
-	if c.Google == nil && c.GitHub == nil {
-		return fmt.Errorf("go-login: at least one OAuth provider (Google or GitHub) must be configured")
+	if c.Google == nil && c.GitHub == nil && c.Clerk == nil {
+		return fmt.Errorf("go-login: at least one provider (Google, GitHub or Clerk) must be configured")
 	}
-	if c.SuccessURL == "" {
+	oauth := c.Google != nil || c.GitHub != nil
+	// The redirect URLs and state secret only exist for the OAuth redirect
+	// dance; a Clerk-only app exchanges tokens over JSON and has no use for them.
+	if oauth && c.SuccessURL == "" {
 		return fmt.Errorf("go-login: SuccessURL is required")
 	}
-	if c.ErrorURL == "" {
+	if oauth && c.ErrorURL == "" {
 		return fmt.Errorf("go-login: ErrorURL is required")
 	}
-	if c.StateSecret == "" {
+	if oauth && c.StateSecret == "" {
 		return fmt.Errorf("go-login: StateSecret is required")
 	}
 	if c.JWTSecret == "" {
 		return fmt.Errorf("go-login: JWTSecret is required")
 	}
-	if c.StateSecret == c.JWTSecret {
+	if c.StateSecret != "" && c.StateSecret == c.JWTSecret {
 		return fmt.Errorf("go-login: StateSecret and JWTSecret must be different")
+	}
+	if c.Clerk != nil && strings.TrimSpace(c.Clerk.IssuerURL) == "" {
+		return fmt.Errorf("go-login: Clerk provider requires IssuerURL")
 	}
 	if c.Google != nil {
 		if c.Google.ClientID == "" || c.Google.ClientSecret == "" || c.Google.RedirectURL == "" {
